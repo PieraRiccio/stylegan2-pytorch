@@ -10,6 +10,8 @@ from torch.autograd import Function
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d
 
+import numpy as np
+
 
 class PixelNorm(nn.Module):
     def __init__(self):
@@ -367,9 +369,14 @@ class Generator(nn.Module):
 
         self.style_dim = style_dim
 
-        layers = [PixelNorm()]
+        self.pixel_norm = PixelNorm()
+        self.label_embed = EqualLinear(4, style_dim) # TODO: pass n. of labels
 
-        for i in range(n_mlp):
+        layers = [EqualLinear(
+            style_dim*2, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
+        )]
+
+        for i in range(n_mlp-1):
             layers.append(
                 EqualLinear(
                     style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
@@ -462,6 +469,7 @@ class Generator(nn.Module):
     def forward(
         self,
         styles,
+        labels,
         return_latents=False,
         inject_index=None,
         truncation=1,
@@ -470,7 +478,12 @@ class Generator(nn.Module):
         noise=None,
         randomize_noise=True,
     ):
+
         if not input_is_latent:
+            styles = [self.pixel_norm(s) for s in styles]
+            labels = self.label_embed(labels)
+            labels = self.pixel_norm(labels)
+            styles = [torch.cat([s, labels], dim=1) for s in styles]
             styles = [self.style(s) for s in styles]
 
         if noise is None:
@@ -508,7 +521,7 @@ class Generator(nn.Module):
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
             latent = torch.cat([latent, latent2], 1)
-
+            
         out = self.input(latent)
         out = self.conv1(out, latent[:, 0], noise=noise[0])
 
@@ -615,6 +628,9 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
+        self.pixel_norm = PixelNorm()
+        self.label_embed = EqualLinear(4, channels[4]) # TODO: pass n. of labels
+
         convs = [ConvLayer(3, channels[size], 1)]
 
         log_size = int(math.log(size, 2))
@@ -636,10 +652,11 @@ class Discriminator(nn.Module):
         self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)
         self.final_linear = nn.Sequential(
             EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
-            EqualLinear(channels[4], 1),
+            EqualLinear(channels[4], channels[4])
         )
 
-    def forward(self, input):
+    def forward(self, input, labels):
+        labels = self.pixel_norm(self.label_embed(labels))
         out = self.convs(input)
 
         batch, channel, height, width = out.shape
@@ -656,6 +673,6 @@ class Discriminator(nn.Module):
 
         out = out.view(batch, -1)
         out = self.final_linear(out)
-
+        out = torch.sum(out*labels, dim=1, keepdim=True)/np.sqrt(out.shape[1])
         return out
 

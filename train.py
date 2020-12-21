@@ -114,6 +114,10 @@ def mixing_noise(batch, latent_dim, prob, device):
     else:
         return [make_noise(batch, latent_dim, 1, device)]
 
+def get_random_labels(batch, n_labels, device):
+    labels = (torch.rand(batch)*n_labels).long()
+    labels = torch.nn.functional.one_hot(labels, num_classes=n_labels).float().to(device)
+    return labels
 
 def set_grad_none(model, targets):
     for n, p in model.named_parameters():
@@ -155,6 +159,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 256, device)
 
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
+    sample_labels = torch.tensor([0,1,2,3]).repeat(args.n_sample//4)
+    sample_labels = torch.nn.functional.one_hot(sample_labels, num_classes=4).float().to(device)
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -164,14 +170,16 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             break
 
-        real_img = next(loader)
+        real_img, real_labels = next(loader)
         real_img = real_img.to(device)
+        real_labels = torch.nn.functional.one_hot(real_labels, num_classes=4).float().to(device)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        fake_labels = get_random_labels(args.batch, 4, device) # TODO: generalize n. of labels
+        fake_img, _ = generator(noise, fake_labels)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -180,8 +188,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         else:
             real_img_aug = real_img
 
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
+        fake_pred = discriminator(fake_img, fake_labels)
+        real_pred = discriminator(real_img_aug, real_labels)
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
         loss_dict["d"] = d_loss
@@ -200,7 +208,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if d_regularize:
             real_img.requires_grad = True
-            real_pred = discriminator(real_img)
+            real_pred = discriminator(real_img, real_labels)
             r1_loss = d_r1_loss(real_pred, real_img)
 
             discriminator.zero_grad()
@@ -214,12 +222,13 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(discriminator, False)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        fake_labels = get_random_labels(args.batch, 4, device) # TODO: generalize n. of labels
+        fake_img, _ = generator(noise, fake_labels)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
+        fake_pred = discriminator(fake_img, fake_labels)
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
@@ -233,7 +242,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
-            fake_img, latents = generator(noise, return_latents=True)
+            fake_labels = get_random_labels(path_batch_size, 4, device) # TODO: generalize n. of labels
+            fake_img, latents = generator(noise, fake_labels, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
@@ -296,7 +306,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if i % 100 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    #raise Exception(sample_z)
+                    sample, _ = g_ema([sample_z], sample_labels)
                     utils.save_image(
                         sample,
                         f"sample/{str(i).zfill(6)}.png",
